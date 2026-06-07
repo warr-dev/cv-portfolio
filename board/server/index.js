@@ -1,93 +1,132 @@
 /**
- * Priority Board API — Express server
+ * Priority Board API — Express + SQLite
  * Serves REST API + static frontend + Swagger docs
+ * DB at ~/.local/share/priority-board/data.db (outside repo)
  */
 
 import express from 'express';
 import cors from 'cors';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import Database from 'better-sqlite3';
+import { homedir } from 'os';
+import { existsSync, readFileSync, mkdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import swaggerJsdoc from 'swagger-jsdoc';
 import swaggerUi from 'swagger-ui-express';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const DATA_FILE = join(__dirname, 'data', 'board.json');
 const FRONTEND_DIR = join(__dirname, '..');
 const PORT = process.env.PORT || 3099;
+
+// ─── SQLite — DB outside repo ────────────────────────────────────
+
+const DB_DIR = process.env.DB_DIR || join(homedir(), '.local', 'share', 'priority-board');
+const DB_FILE = join(DB_DIR, 'data.db');
+
+if (!existsSync(DB_DIR)) {
+  mkdirSync(DB_DIR, { recursive: true });
+}
+
+// ─── Initialize DB ───────────────────────────────────────────────
+
+const db = new Database(DB_FILE);
+db.pragma('journal_mode = WAL');
+db.pragma('foreign_keys = ON');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS projects (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    priority   TEXT NOT NULL DEFAULT 'high' CHECK(priority IN ('critical','high','medium','low')),
+    description TEXT DEFAULT '',
+    columns    TEXT NOT NULL DEFAULT '["Backlog","To Do","In Progress","Done"]',
+    created_at INTEGER NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS tasks (
+    id          TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title       TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    priority    TEXT DEFAULT '',
+    assignee    TEXT DEFAULT '',
+    column_name TEXT NOT NULL,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  INTEGER NOT NULL
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+`);
+
+// ─── Prepared statements ────────────────────────────────────────
+
+const stmts = {
+  getAllProjects:         db.prepare('SELECT * FROM projects ORDER BY created_at ASC'),
+  getProjectById:         db.prepare('SELECT * FROM projects WHERE id = ?'),
+  insertProject:          db.prepare('INSERT INTO projects (id, name, priority, description, columns, created_at) VALUES (?, ?, ?, ?, ?, ?)'),
+  updateProject:          db.prepare('UPDATE projects SET name = ?, priority = ?, description = ?, columns = ? WHERE id = ?'),
+  deleteProject:          db.prepare('DELETE FROM projects WHERE id = ?'),
+  getTasksByProject:      db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY sort_order ASC'),
+  getTaskById:            db.prepare('SELECT * FROM tasks WHERE id = ?'),
+  insertTask:             db.prepare('INSERT INTO tasks (id, project_id, title, description, priority, assignee, column_name, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+  updateTask:             db.prepare('UPDATE tasks SET title = ?, description = ?, priority = ?, assignee = ?, column_name = ? WHERE id = ?'),
+  deleteTask:             db.prepare('DELETE FROM tasks WHERE id = ?'),
+  deleteTasksByProject:   db.prepare('DELETE FROM tasks WHERE project_id = ?'),
+  getMaxOrder:            db.prepare('SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM tasks WHERE project_id = ? AND column_name = ?'),
+  reorderTask:            db.prepare('UPDATE tasks SET column_name = ?, sort_order = ? WHERE id = ?'),
+  deleteAllProjects:      db.prepare('DELETE FROM projects'),
+  deleteAllTasks:         db.prepare('DELETE FROM tasks'),
+};
+
+// ─── Helpers ─────────────────────────────────────────────────────
+
+function rowToProject(row) {
+  return { id: row.id, name: row.name, priority: row.priority, description: row.description || '', columns: JSON.parse(row.columns), tasks: [], createdAt: row.created_at };
+}
+
+function rowToTask(row) {
+  return { id: row.id, title: row.title, description: row.description || '', priority: row.priority || '', assignee: row.assignee || '', column: row.column_name, order: row.sort_order, createdAt: row.created_at };
+}
+
+function hydrateProject(row) {
+  const project = rowToProject(row);
+  project.tasks = stmts.getTasksByProject.all(row.id).map(rowToTask);
+  return project;
+}
+
+function fullData() {
+  return { projects: stmts.getAllProjects.all().map(hydrateProject) };
+}
+
+// ─── Migration from board.json ──────────────────────────────────
+
+const OLD_DATA_FILE = join(__dirname, 'data', 'board.json');
+function migrateIfNeeded() {
+  if (stmts.getAllProjects.all().length > 0) return;
+  if (!existsSync(OLD_DATA_FILE)) return;
+
+  console.log('Migrating from board.json...');
+  const oldData = JSON.parse(readFileSync(OLD_DATA_FILE, 'utf-8'));
+
+  const tx = db.transaction(() => {
+    for (const project of (oldData.projects || [])) {
+      stmts.insertProject.run(project.id, project.name, project.priority || 'high', project.description || '', JSON.stringify(project.columns || ['Backlog','To Do','In Progress','Done']), project.createdAt || Date.now());
+      for (const task of (project.tasks || [])) {
+        stmts.insertTask.run(task.id, project.id, task.title, task.description || '', task.priority || '', task.assignee || '', task.column || 'Backlog', task.order || 0, task.createdAt || Date.now());
+      }
+    }
+  });
+  tx();
+  console.log(`Migrated ${oldData.projects?.length || 0} projects.`);
+}
+
+migrateIfNeeded();
+
+// ─── Express app ─────────────────────────────────────────────────
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '1mb' }));
-
-// ─── Data persistence ────────────────────────────────────────────
-
-function ensureDataDir() {
-  const dir = dirname(DATA_FILE);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-}
-
-function loadData() {
-  ensureDataDir();
-  if (!existsSync(DATA_FILE)) {
-    const defaultData = {
-      projects: [
-        {
-          id: crypto.randomUUID(),
-          name: 'Backend API v3',
-          priority: 'high',
-          description: 'RESTful API rewrite with Laravel 11',
-          columns: ['Backlog', 'To Do', 'In Progress', 'Review', 'Done'],
-          tasks: [
-            { id: crypto.randomUUID(), title: 'Auth middleware refactor', description: 'Replace current JWT with Laravel Sanctum', priority: 'critical', assignee: '', column: 'To Do', order: 0, createdAt: Date.now() - 86400000 },
-            { id: crypto.randomUUID(), title: 'Rate limiting middleware', description: '100 req/min per user', priority: 'high', assignee: 'Warren', column: 'In Progress', order: 0, createdAt: Date.now() - 43200000 },
-            { id: crypto.randomUUID(), title: 'Swagger/OpenAPI docs', description: 'Auto-generate from route annotations', priority: '', assignee: '', column: 'Backlog', order: 0, createdAt: Date.now() },
-          ],
-          createdAt: Date.now() - 172800000,
-        },
-        {
-          id: crypto.randomUUID(),
-          name: 'Portfolio Chat',
-          priority: 'medium',
-          description: 'AI chat widget on portfolio site',
-          columns: ['Backlog', 'To Do', 'In Progress', 'Done'],
-          tasks: [
-            { id: crypto.randomUUID(), title: 'Add typing indicators', description: 'Show "AI is typing..." while generating', priority: 'medium', assignee: '', column: 'To Do', order: 0, createdAt: Date.now() - 3600000 },
-            { id: crypto.randomUUID(), title: 'Session persistence', description: 'Keep conversation across page reloads', priority: '', assignee: '', column: 'Done', order: 0, createdAt: Date.now() - 7200000 },
-          ],
-          createdAt: Date.now() - 86400000,
-        },
-      ],
-    };
-    writeFileSync(DATA_FILE, JSON.stringify(defaultData, null, 2));
-    return defaultData;
-  }
-  return JSON.parse(readFileSync(DATA_FILE, 'utf-8'));
-}
-
-function saveData(data) {
-  ensureDataDir();
-  writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────
-
-function findProjectOr404(data, projectId) {
-  const project = data.projects.find(p => p.id === projectId);
-  if (!project) return null;
-  return project;
-}
-
-function findTaskOr404(project, taskId) {
-  const task = project.tasks.find(t => t.id === taskId);
-  if (!task) return null;
-  return task;
-}
-
-function getNextOrder(tasks, column) {
-  const colTasks = tasks.filter(t => t.column === column);
-  return colTasks.length > 0 ? Math.max(...colTasks.map(t => t.order)) + 1 : 0;
-}
 
 // ─── Swagger / OpenAPI ──────────────────────────────────────────
 
@@ -97,79 +136,55 @@ const swaggerSpec = swaggerJsdoc({
     info: {
       title: 'Priority Board API',
       version: '1.0.0',
-      description: `REST API for the Priority Board — a Trello/Jira-like project & task manager with priority levels.
-
-**Base URL:** \`/api\`
-
-**Data model:**
-- **Projects** have a name, priority (critical/high/medium/low), custom columns, and tasks
-- **Tasks** have a title, priority (can be empty to inherit from project), status column, and assignee
-
-All endpoints are under \`/api\` and return JSON.`,
+      description: `REST API for the Priority Board — Trello/Jira-like project & task manager with priority levels.\nStored in SQLite at \`~/.local/share/priority-board/data.db\`\n\n**Base URL:** \`/api\``,
       contact: { name: 'Warrbot' },
     },
-    servers: [
-      { url: '/api', description: 'API base path' },
-    ],
+    servers: [{ url: '/api', description: 'API base path' }],
     tags: [
-      { name: 'Data', description: 'Bulk data operations (load/save full board)' },
+      { name: 'Data', description: 'Bulk data operations' },
       { name: 'Projects', description: 'Project CRUD' },
       { name: 'Tasks', description: 'Task CRUD and reordering' },
     ],
     components: {
       schemas: {
-        Priority: {
-          type: 'string',
-          enum: ['critical', 'high', 'medium', 'low'],
-          description: 'Priority level',
-        },
+        Priority: { type: 'string', enum: ['critical', 'high', 'medium', 'low'] },
         Project: {
-          type: 'object',
-          required: ['id', 'name', 'priority', 'columns', 'tasks', 'createdAt'],
+          type: 'object', required: ['id', 'name', 'priority'],
           properties: {
-            id: { type: 'string', format: 'uuid', description: 'Unique project ID' },
-            name: { type: 'string', description: 'Project name' },
+            id: { type: 'string', format: 'uuid' },
+            name: { type: 'string' },
             priority: { $ref: '#/components/schemas/Priority' },
-            description: { type: 'string', description: 'Project description' },
-            columns: { type: 'array', items: { type: 'string' }, description: 'Column names in order (e.g. ["Backlog","To Do","In Progress","Done"])' },
-            tasks: { type: 'array', items: { $ref: '#/components/schemas/Task' }, description: 'Tasks in this project' },
-            createdAt: { type: 'integer', description: 'Unix timestamp' },
+            description: { type: 'string' },
+            columns: { type: 'array', items: { type: 'string' } },
+            tasks: { type: 'array', items: { $ref: '#/components/schemas/Task' } },
+            createdAt: { type: 'integer' },
           },
         },
         Task: {
-          type: 'object',
-          required: ['id', 'title', 'column', 'order', 'createdAt'],
+          type: 'object', required: ['id', 'title'],
           properties: {
-            id: { type: 'string', format: 'uuid', description: 'Unique task ID' },
-            title: { type: 'string', description: 'Task title' },
-            description: { type: 'string', description: 'Task description' },
-            priority: { type: 'string', nullable: true, description: 'Task priority override (null/empty = inherit from project)' },
-            assignee: { type: 'string', description: 'Assigned person' },
-            column: { type: 'string', description: 'Which column this task belongs to' },
-            order: { type: 'integer', description: 'Sort order within column' },
-            createdAt: { type: 'integer', description: 'Unix timestamp' },
+            id: { type: 'string', format: 'uuid' },
+            title: { type: 'string' },
+            description: { type: 'string' },
+            priority: { type: 'string', nullable: true },
+            assignee: { type: 'string' },
+            column: { type: 'string' },
+            order: { type: 'integer' },
+            createdAt: { type: 'integer' },
           },
         },
         BoardData: {
-          type: 'object',
-          required: ['projects'],
-          properties: {
-            projects: { type: 'array', items: { $ref: '#/components/schemas/Project' } },
-          },
+          type: 'object', required: ['projects'],
+          properties: { projects: { type: 'array', items: { $ref: '#/components/schemas/Project' } } },
         },
-        Error: {
-          type: 'object',
-          properties: {
-            error: { type: 'string', description: 'Error message' },
-          },
-        },
+        Error: { type: 'object', properties: { error: { type: 'string' } } },
       },
     },
   },
-  apis: [join(__dirname, 'index.js')], // Parse JSDoc annotations from routes
+  apis: [join(__dirname, 'index.js')],
 });
 
-// ─── API Routes ─────────────────────────────────────────────────
+// ─── API Routes ──────────────────────────────────────────────────
 
 /**
  * @openapi
@@ -177,81 +192,55 @@ All endpoints are under \`/api\` and return JSON.`,
  *   get:
  *     tags: [Data]
  *     summary: Get full board data
- *     description: Returns all projects with their tasks and columns. This is the primary endpoint for the frontend to load the entire board.
  *     responses:
  *       200:
- *         description: Full board data
+ *         description: All projects with tasks
  *         content:
  *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/BoardData'
+ *             schema: { $ref: '#/components/schemas/BoardData' }
  */
-app.get('/api/data', (req, res) => {
-  const data = loadData();
-  res.json(data);
-});
+app.get('/api/data', (req, res) => res.json(fullData()));
 
 /**
  * @openapi
  * /data:
  *   put:
  *     tags: [Data]
- *     summary: Replace full board data
- *     description: Replaces the entire board state. The body must contain a `projects` array.
+ *     summary: Replace all board data (bulk import)
  *     requestBody:
  *       required: true
  *       content:
  *         application/json:
- *           schema:
- *             $ref: '#/components/schemas/BoardData'
+ *           schema: { $ref: '#/components/schemas/BoardData' }
  *     responses:
  *       200:
  *         description: Data saved
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 ok: { type: boolean }
- *                 count: { type: integer, description: 'Number of projects saved' }
  *       400:
- *         description: Invalid data
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *         description: Invalid format
  */
 app.put('/api/data', (req, res) => {
   const body = req.body;
   if (!body || !Array.isArray(body.projects)) {
     return res.status(400).json({ error: 'Body must contain a "projects" array' });
   }
-  saveData(body);
+  const tx = db.transaction(() => {
+    stmts.deleteAllTasks.run();
+    stmts.deleteAllProjects.run();
+    for (const project of body.projects) {
+      stmts.insertProject.run(project.id, project.name, project.priority || 'high', project.description || '', JSON.stringify(project.columns || ['Backlog','To Do','In Progress','Done']), project.createdAt || Date.now());
+      for (const task of (project.tasks || [])) {
+        stmts.insertTask.run(task.id, project.id, task.title, task.description || '', task.priority || '', task.assignee || '', task.column || 'Backlog', task.order || 0, task.createdAt || Date.now());
+      }
+    }
+  });
+  tx();
   res.json({ ok: true, count: body.projects.length });
 });
 
 // ── Projects ─────────────────────────────────────────────────────
 
-/**
- * @openapi
- * /projects:
- *   get:
- *     tags: [Projects]
- *     summary: List all projects
- *     description: Returns an array of all projects with their tasks included.
- *     responses:
- *       200:
- *         description: Array of projects
- *         content:
- *           application/json:
- *             schema:
- *               type: array
- *               items:
- *                 $ref: '#/components/schemas/Project'
- */
 app.get('/api/projects', (req, res) => {
-  const data = loadData();
-  res.json(data.projects);
+  res.json(stmts.getAllProjects.all().map(hydrateProject));
 });
 
 /**
@@ -259,32 +248,22 @@ app.get('/api/projects', (req, res) => {
  * /projects/{id}:
  *   get:
  *     tags: [Projects]
- *     summary: Get a single project
+ *     summary: Get single project with tasks
  *     parameters:
  *       - in: path
  *         name: id
  *         required: true
- *         schema: { type: string, format: uuid }
- *         description: Project ID
+ *         schema: { type: string }
  *     responses:
  *       200:
- *         description: Project object
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Project'
+ *         description: Project
  *       404:
- *         description: Project not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *         description: Not found
  */
 app.get('/api/projects/:id', (req, res) => {
-  const data = loadData();
-  const project = findProjectOr404(data, req.params.id);
-  if (!project) return res.status(404).json({ error: 'Project not found' });
-  res.json(project);
+  const row = stmts.getProjectById.get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Project not found' });
+  res.json(hydrateProject(row));
 });
 
 /**
@@ -292,8 +271,7 @@ app.get('/api/projects/:id', (req, res) => {
  * /projects:
  *   post:
  *     tags: [Projects]
- *     summary: Create a new project
- *     description: Creates a project with default columns (Backlog, To Do, In Progress, Done).
+ *     summary: Create a project
  *     requestBody:
  *       required: true
  *       content:
@@ -302,38 +280,26 @@ app.get('/api/projects/:id', (req, res) => {
  *             type: object
  *             required: [name]
  *             properties:
- *               name: { type: string, description: 'Project name' }
- *               priority: { $ref: '#/components/schemas/Priority', description: 'Defaults to high' }
+ *               name: { type: string }
+ *               priority: { $ref: '#/components/schemas/Priority' }
  *               description: { type: string }
- *               columns: { type: array, items: { type: string }, description: 'Custom columns (optional, uses defaults if omitted)' }
+ *               columns: { type: array, items: { type: string } }
  *     responses:
  *       201:
- *         description: Created project
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Project'
+ *         description: Created
  *       400:
- *         description: Name is required
+ *         description: Name required
  */
 app.post('/api/projects', (req, res) => {
-  const data = loadData();
   const { name, priority = 'high', description = '', columns } = req.body;
   if (!name || !name.trim()) {
     return res.status(400).json({ error: 'Project name is required' });
   }
-  const project = {
-    id: crypto.randomUUID(),
-    name: name.trim(),
-    priority: priority || 'high',
-    description,
-    columns: columns && columns.length > 0 ? columns : ['Backlog', 'To Do', 'In Progress', 'Done'],
-    tasks: [],
-    createdAt: Date.now(),
-  };
-  data.projects.push(project);
-  saveData(data);
-  res.status(201).json(project);
+  const id = crypto.randomUUID();
+  const createdAt = Date.now();
+  const cols = columns && columns.length > 0 ? columns : ['Backlog', 'To Do', 'In Progress', 'Done'];
+  stmts.insertProject.run(id, name.trim(), priority, description, JSON.stringify(cols), createdAt);
+  res.status(201).json(rowToProject(stmts.getProjectById.get(id)));
 });
 
 /**
@@ -342,12 +308,11 @@ app.post('/api/projects', (req, res) => {
  *   put:
  *     tags: [Projects]
  *     summary: Update a project
- *     description: Updates project name, priority, description, and/or columns.
  *     parameters:
  *       - in: path
  *         name: id
  *         required: true
- *         schema: { type: string, format: uuid }
+ *         schema: { type: string }
  *     requestBody:
  *       required: true
  *       content:
@@ -361,30 +326,26 @@ app.post('/api/projects', (req, res) => {
  *               columns: { type: array, items: { type: string } }
  *     responses:
  *       200:
- *         description: Updated project
+ *         description: Updated
  *       404:
- *         description: Project not found
+ *         description: Not found
  */
 app.put('/api/projects/:id', (req, res) => {
-  const data = loadData();
-  const project = findProjectOr404(data, req.params.id);
-  if (!project) return res.status(404).json({ error: 'Project not found' });
-
+  const row = stmts.getProjectById.get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Project not found' });
   const { name, priority, description, columns } = req.body;
-  if (name !== undefined) project.name = name.trim();
-  if (priority !== undefined) project.priority = priority;
-  if (description !== undefined) project.description = description;
-  if (columns !== undefined && Array.isArray(columns) && columns.length > 0) {
-    // Migrate tasks to renamed/deleted columns
-    project.columns = columns;
-    project.tasks.forEach(t => {
-      if (!columns.includes(t.column)) {
-        t.column = columns[0]; // Move orphaned tasks to first column
-      }
-    });
+  stmts.updateProject.run(
+    name !== undefined ? name.trim() : row.name,
+    priority !== undefined ? priority : row.priority,
+    description !== undefined ? description : (row.description || ''),
+    columns !== undefined && columns.length > 0 ? JSON.stringify(columns) : row.columns,
+    req.params.id
+  );
+  if (columns && columns.length > 0) {
+    const orphanSql = `UPDATE tasks SET column_name = ? WHERE project_id = ? AND column_name NOT IN (${columns.map(() => '?').join(',')})`;
+    db.prepare(orphanSql).run(columns[0], req.params.id, ...columns);
   }
-  saveData(data);
-  res.json(project);
+  res.json(hydrateProject(stmts.getProjectById.get(req.params.id)));
 });
 
 /**
@@ -397,19 +358,18 @@ app.put('/api/projects/:id', (req, res) => {
  *       - in: path
  *         name: id
  *         required: true
- *         schema: { type: string, format: uuid }
+ *         schema: { type: string }
  *     responses:
  *       200:
- *         description: Project deleted
+ *         description: Deleted
  *       404:
- *         description: Project not found
+ *         description: Not found
  */
 app.delete('/api/projects/:id', (req, res) => {
-  const data = loadData();
-  const idx = data.projects.findIndex(p => p.id === req.params.id);
-  if (idx === -1) return res.status(404).json({ error: 'Project not found' });
-  data.projects.splice(idx, 1);
-  saveData(data);
+  const row = stmts.getProjectById.get(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Project not found' });
+  stmts.deleteTasksByProject.run(req.params.id);
+  stmts.deleteProject.run(req.params.id);
   res.json({ ok: true });
 });
 
@@ -425,7 +385,7 @@ app.delete('/api/projects/:id', (req, res) => {
  *       - in: path
  *         name: projectId
  *         required: true
- *         schema: { type: string, format: uuid }
+ *         schema: { type: string }
  *     requestBody:
  *       required: true
  *       content:
@@ -436,48 +396,31 @@ app.delete('/api/projects/:id', (req, res) => {
  *             properties:
  *               title: { type: string }
  *               description: { type: string }
- *               priority: { type: string, nullable: true, description: 'Empty string or null = inherit from project' }
+ *               priority: { type: string, nullable: true }
  *               assignee: { type: string }
- *               column: { type: string, description: 'Must be one of the project columns' }
+ *               column: { type: string }
  *     responses:
  *       201:
- *         description: Created task
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Task'
- *       400:
- *         description: Invalid column or missing title
+ *         description: Created
  *       404:
  *         description: Project not found
  */
 app.post('/api/projects/:projectId/tasks', (req, res) => {
-  const data = loadData();
-  const project = findProjectOr404(data, req.params.projectId);
+  const project = stmts.getProjectById.get(req.params.projectId);
   if (!project) return res.status(404).json({ error: 'Project not found' });
-
   const { title, description = '', priority = '', assignee = '', column } = req.body;
   if (!title || !title.trim()) {
     return res.status(400).json({ error: 'Task title is required' });
   }
-  const targetCol = column || project.columns[0];
-  if (!project.columns.includes(targetCol)) {
-    return res.status(400).json({ error: `Invalid column "${targetCol}". Valid columns: ${project.columns.join(', ')}` });
+  const cols = JSON.parse(project.columns);
+  const targetCol = column || cols[0];
+  if (!cols.includes(targetCol)) {
+    return res.status(400).json({ error: `Invalid column "${targetCol}". Valid: ${cols.join(', ')}` });
   }
-
-  const task = {
-    id: crypto.randomUUID(),
-    title: title.trim(),
-    description,
-    priority: priority || '',
-    assignee,
-    column: targetCol,
-    order: getNextOrder(project.tasks, targetCol),
-    createdAt: Date.now(),
-  };
-  project.tasks.push(task);
-  saveData(data);
-  res.status(201).json(task);
+  const id = crypto.randomUUID();
+  const nextOrder = stmts.getMaxOrder.get(req.params.projectId, targetCol).next;
+  stmts.insertTask.run(id, req.params.projectId, title.trim(), description, priority, assignee, targetCol, nextOrder, Date.now());
+  res.status(201).json(rowToTask(stmts.getTaskById.get(id)));
 });
 
 /**
@@ -490,7 +433,7 @@ app.post('/api/projects/:projectId/tasks', (req, res) => {
  *       - in: path
  *         name: id
  *         required: true
- *         schema: { type: string, format: uuid }
+ *         schema: { type: string }
  *     requestBody:
  *       required: true
  *       content:
@@ -505,35 +448,29 @@ app.post('/api/projects/:projectId/tasks', (req, res) => {
  *               column: { type: string }
  *     responses:
  *       200:
- *         description: Updated task
+ *         description: Updated
  *       404:
- *         description: Task not found
+ *         description: Not found
  */
 app.put('/api/tasks/:id', (req, res) => {
-  const data = loadData();
-
-  // Find task across all projects
-  for (const project of data.projects) {
-    const task = findTaskOr404(project, req.params.id);
-    if (task) {
-      const { title, description, priority, assignee, column } = req.body;
-      if (title !== undefined) task.title = title.trim();
-      if (description !== undefined) task.description = description;
-      if (priority !== undefined) task.priority = priority;
-      if (assignee !== undefined) task.assignee = assignee;
-
-      if (column !== undefined) {
-        if (!project.columns.includes(column)) {
-          return res.status(400).json({ error: `Invalid column "${column}"` });
-        }
-        task.column = column;
-      }
-
-      saveData(data);
-      return res.json(task);
+  const task = stmts.getTaskById.get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  const { title, description, priority, assignee, column } = req.body;
+  if (column) {
+    const proj = stmts.getProjectById.get(task.project_id);
+    if (proj && !JSON.parse(proj.columns).includes(column)) {
+      return res.status(400).json({ error: `Invalid column "${column}"` });
     }
   }
-  res.status(404).json({ error: 'Task not found' });
+  stmts.updateTask.run(
+    title !== undefined ? title.trim() : task.title,
+    description !== undefined ? description : (task.description || ''),
+    priority !== undefined ? priority : (task.priority || ''),
+    assignee !== undefined ? assignee : (task.assignee || ''),
+    column !== undefined ? column : task.column_name,
+    req.params.id
+  );
+  res.json(rowToTask(stmts.getTaskById.get(req.params.id)));
 });
 
 /**
@@ -546,24 +483,18 @@ app.put('/api/tasks/:id', (req, res) => {
  *       - in: path
  *         name: id
  *         required: true
- *         schema: { type: string, format: uuid }
+ *         schema: { type: string }
  *     responses:
  *       200:
- *         description: Task deleted
+ *         description: Deleted
  *       404:
- *         description: Task not found
+ *         description: Not found
  */
 app.delete('/api/tasks/:id', (req, res) => {
-  const data = loadData();
-  for (const project of data.projects) {
-    const idx = project.tasks.findIndex(t => t.id === req.params.id);
-    if (idx !== -1) {
-      project.tasks.splice(idx, 1);
-      saveData(data);
-      return res.json({ ok: true });
-    }
-  }
-  res.status(404).json({ error: 'Task not found' });
+  const task = stmts.getTaskById.get(req.params.id);
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  stmts.deleteTask.run(req.params.id);
+  res.json({ ok: true });
 });
 
 /**
@@ -571,8 +502,7 @@ app.delete('/api/tasks/:id', (req, res) => {
  * /tasks/reorder:
  *   patch:
  *     tags: [Tasks]
- *     summary: Reorder tasks (batch update)
- *     description: Batch-update task columns and orders after drag-and-drop. Accepts an array of { id, column, order } updates.
+ *     summary: Batch reorder tasks after drag-and-drop
  *     requestBody:
  *       required: true
  *       content:
@@ -587,38 +517,24 @@ app.delete('/api/tasks/:id', (req, res) => {
  *                   type: object
  *                   required: [id, column, order]
  *                   properties:
- *                     id: { type: string, format: uuid }
+ *                     id: { type: string }
  *                     column: { type: string }
  *                     order: { type: integer }
  *     responses:
  *       200:
- *         description: Tasks reordered
- *       400:
- *         description: Invalid request
+ *         description: Reordered
  */
 app.patch('/api/tasks/reorder', (req, res) => {
-  const data = loadData();
   const { tasks } = req.body;
   if (!Array.isArray(tasks)) {
     return res.status(400).json({ error: '"tasks" array is required' });
   }
-
-  for (const update of tasks) {
-    for (const project of data.projects) {
-      const task = findTaskOr404(project, update.id);
-      if (task) {
-        if (update.column !== undefined && project.columns.includes(update.column)) {
-          task.column = update.column;
-        }
-        if (update.order !== undefined) {
-          task.order = update.order;
-        }
-        break;
-      }
+  const tx = db.transaction(() => {
+    for (const update of tasks) {
+      stmts.reorderTask.run(update.column, update.order, update.id);
     }
-  }
-
-  saveData(data);
+  });
+  tx();
   res.json({ ok: true, updated: tasks.length });
 });
 
@@ -629,27 +545,19 @@ app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
   customSiteTitle: 'Priority Board API Docs',
 }));
 
-// Serve raw OpenAPI JSON
-app.get('/api/openapi.json', (req, res) => {
-  res.json(swaggerSpec);
-});
+app.get('/api/openapi.json', (req, res) => res.json(swaggerSpec));
 
 // ─── Static frontend ────────────────────────────────────────────
 
 app.use(express.static(FRONTEND_DIR, {
   index: 'index.html',
-  extensions: ['html'],
-  setHeaders: (res, path) => {
-    if (path.endsWith('.html')) {
-      res.set('Cache-Control', 'no-cache');
-    }
-  },
+  setHeaders: (res, path) => { if (path.endsWith('.html')) res.set('Cache-Control', 'no-cache'); },
 }));
 
 // ─── Start ──────────────────────────────────────────────────────
 
 app.listen(PORT, () => {
   console.log(`Priority Board API running on http://localhost:${PORT}`);
+  console.log(`SQLite DB at: ${DB_FILE}`);
   console.log(`API docs: http://localhost:${PORT}/api/docs`);
-  console.log(`Frontend: http://localhost:${PORT}`);
 });
