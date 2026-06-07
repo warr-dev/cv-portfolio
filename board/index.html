@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Priority Board — Warrbot</title>
+  <link rel="stylesheet" href="css/style.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer">
+</head>
+<body>
+  <div id="app">
+    <!-- Top bar -->
+    <header id="topbar">
+      <div class="topbar-left">
+        <h1><i class="fas fa-tasks"></i> Priority Board</h1>
+      </div>
+      <div class="topbar-center" id="project-tabs"></div>
+      <div class="topbar-right">
+        <button class="btn btn-sm btn-outline" onclick="showProjectModal()" title="New Project"><i class="fas fa-plus"></i> Project</button>
+        <button class="btn btn-sm btn-outline" onclick="exportData()" title="Export JSON"><i class="fas fa-download"></i></button>
+        <button class="btn btn-sm btn-outline" onclick="document.getElementById('import-input').click()" title="Import JSON"><i class="fas fa-upload"></i></button>
+        <input type="file" id="import-input" accept=".json" style="display:none" onchange="importData(event)">
+      </div>
+    </header>
+
+    <!-- Main layout -->
+    <div id="main-layout">
+      <!-- Sidebar: Project list -->
+      <aside id="sidebar">
+        <div class="sidebar-header">
+          <span><i class="fas fa-folder-open"></i> Projects</span>
+          <button class="btn btn-xs btn-ghost" onclick="showProjectModal()"><i class="fas fa-plus"></i></button>
+        </div>
+        <div id="project-list" class="project-list"></div>
+      </aside>
+
+      <!-- Board area -->
+      <section id="board-area">
+        <div class="board-header">
+          <div id="board-title" class="board-title"><i class="fas fa-th-large"></i> <span id="project-name-display">Select a project</span></div>
+          <div class="board-actions">
+            <button class="btn btn-sm btn-outline" onclick="showColumnModal()" title="Manage Columns"><i class="fas fa-columns"></i> Columns</button>
+            <button class="btn btn-sm btn-primary" onclick="showTaskModal()" title="Add Task"><i class="fas fa-plus"></i> Task</button>
+          </div>
+        </div>
+        <div id="board" class="board">
+          <div class="board-empty" id="board-empty">
+            <i class="fas fa-arrow-left"></i> Select or create a project to get started
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Project Modal -->
+  <div id="project-modal" class="modal-overlay" style="display:none" onclick="closeModals(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h3 id="project-modal-title"><i class="fas fa-folder"></i> New Project</h3>
+        <button class="btn btn-ghost" onclick="closeModals()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="project-edit-id">
+        <div class="field">
+          <label>Project Name</label>
+          <input type="text" id="project-name" placeholder="e.g. Backend API v3" autofocus>
+        </div>
+        <div class="field">
+          <label>Priority</label>
+          <select id="project-priority">
+            <option value="critical">🔴 Critical (P0)</option>
+            <option value="high" selected>🟠 High (P1)</option>
+            <option value="medium">🟡 Medium (P2)</option>
+            <option value="low">🟢 Low (P3)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Description</label>
+          <textarea id="project-desc" rows="2" placeholder="Optional project description"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+        <button class="btn btn-primary" id="project-save-btn" onclick="saveProject()">Create</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Column Modal -->
+  <div id="column-modal" class="modal-overlay" style="display:none" onclick="closeModals(event)">
+    <div class="modal modal-sm" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h3><i class="fas fa-columns"></i> Manage Columns</h3>
+        <button class="btn btn-ghost" onclick="closeModals()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="column-list"></div>
+        <div class="field" style="margin-top:12px; display:flex; gap:8px;">
+          <input type="text" id="new-column-name" placeholder="New column name" style="flex:1">
+          <button class="btn btn-primary btn-sm" onclick="addColumn()">Add</button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" onclick="closeModals()">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task Modal -->
+  <div id="task-modal" class="modal-overlay" style="display:none" onclick="closeModals(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h3 id="task-modal-title"><i class="fas fa-card"></i> New Task</h3>
+        <button class="btn btn-ghost" onclick="closeModals()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="task-edit-id">
+        <input type="hidden" id="task-column">
+        <div class="field">
+          <label>Title</label>
+          <input type="text" id="task-title" placeholder="What needs to be done?" autofocus>
+        </div>
+        <div class="field">
+          <label>Description</label>
+          <textarea id="task-desc" rows="3" placeholder="Details..."></textarea>
+        </div>
+        <div class="field">
+          <label>Priority</label>
+          <select id="task-priority">
+            <option value="">⬜ Use project default</option>
+            <option value="critical">🔴 Critical (P0)</option>
+            <option value="high">🟠 High (P1)</option>
+            <option value="medium">🟡 Medium (P2)</option>
+            <option value="low">🟢 Low (P3)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Assigned To</label>
+          <input type="text" id="task-assignee" placeholder="Optional assignee name">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+        <button class="btn btn-danger btn-sm" id="task-delete-btn" onclick="deleteTask()" style="display:none"><i class="fas fa-trash"></i></button>
+        <button class="btn btn-primary" id="task-save-btn" onclick="saveTask()">Add</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Confirm modal -->
+  <div id="confirm-modal" class="modal-overlay" style="display:none" onclick="closeModals(event)">
+    <div class="modal modal-sm" onclick="event.stopPropagation()">
+      <div class="modal-header">
+        <h3><i class="fas fa-exclamation-triangle"></i> Confirm</h3>
+        <button class="btn btn-ghost" onclick="closeModals()">&times;</button>
+      </div>
+      <div class="modal-body" id="confirm-body">Are you sure?</div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModals()">Cancel</button>
+        <button class="btn btn-danger" id="confirm-yes" onclick="closeModals()">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.6/Sortable.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="js/store.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
